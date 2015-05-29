@@ -25,38 +25,51 @@
 #include <errno.h>
 #include <pthread.h>
 #include <sys/resource.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/time.h>
+
+#ifndef SYS_gettid
+#error "SYS_gettid unavailable on this system"
+#endif
 
 #define CLOCK CLOCK_MONOTONIC
-
+#define MAX_INSTANCES 100
 
 static float requested_load;
-static float actual_load;
 static int ticks_per_second;
 static int us_per_tick;
+static int instances;
+static pid_t pid;
 
-static struct rusage lru;
+static struct sload {
+	pid_t tid;
+	struct rusage ru;
+	struct rusage lru;
+	float actual_load;
+	float e;
+	float p;
+	float pp;
+	float i;
+	float itmp;
+	float d;
+	float dtmp;
+	float out;
+	float lastout;
+	uint64_t looplimit;
+	int updated;
+} load[MAX_INSTANCES];
 
 #define ILIMIT 10000.0
 
 static float dtns;
-static float e = 0.0;
 static float Kp = 200000.0;
-static float p  = 0.0;
 static float Ki = 500.0;
-static float itmp = 0.0;
 static float imin = -1.0 * ILIMIT;
 static float imax = 1.0 * ILIMIT;
-static float i  = 0.0;
 static float Kd = 2.0;
-static float d  = 0.0;
-static float dtmp  = 0.0;
-static float pp = 0.0;
-static float out = 0.0;
 static float outmax = 100000000.0;
 static float outmin = 0.0;
-static float lastout = 0.0;
-
-static uint64_t looplimit;
 
 static void ts_add(const struct timespec *t1, const struct timespec *t2, struct timespec *t)
 {
@@ -83,7 +96,7 @@ static void ts_sub(struct timespec *t1, struct timespec *t2, struct timespec *re
  * helper calling a function at a specifid periodic rate, which should be below 1 sec.
  * work time is expected to be guaranteed less than (period time - clock setup time)
  */
-static void periodic_loop(const struct timespec *period, void (*work)(struct timespec *))
+static void periodic_loop(const struct timespec *period, void (*work)(struct timespec *, struct sload *l), struct sload *l)
 {
 	struct timespec tbase;
 	struct timespec tbefore, tafter, tactual;
@@ -110,14 +123,15 @@ static void periodic_loop(const struct timespec *period, void (*work)(struct tim
 			// get time to schedule this in, we are already past our period!
 			continue;
 		}
-		work(&tactual);
+		work(&tactual, l);
 	}
 }
 
-static void gen_load(struct timespec *tactual)
+static void gen_load(struct timespec *tactual, struct sload *l)
 {
 	static unsigned int volatile dummy;
 	int i;
+	int status;
 
 	// here we do the actual dummy work
 	if (requested_load >= 100.0) {
@@ -125,10 +139,13 @@ static void gen_load(struct timespec *tactual)
 			dummy = (int)requested_load;
 		}
 	} else {
-		for (i=0; i<looplimit; i++) {
+		for (i=0; i<l->looplimit; i++) {
 			dummy = i;
 		}
 	}
+	status = getrusage(RUSAGE_THREAD, &(l->ru));
+	if (status)
+		perror("getrusage");
 }
 
 static void *dummy_load(void *arg)
@@ -136,6 +153,7 @@ static void *dummy_load(void *arg)
 	int status;
 	struct sched_param threadsched;
 	struct timespec period;
+	struct sload *l = (struct sload *)arg;
 
 	threadsched.sched_priority = 36;
 	status = sched_setscheduler(0, SCHED_FIFO, &threadsched);
@@ -144,11 +162,16 @@ static void *dummy_load(void *arg)
 		pthread_exit(&status);
 	}
 
+	//load[instance].tid = gettid();
+	l->tid = syscall(SYS_gettid);
+
 	period.tv_sec = 0;
 	period.tv_nsec = (uint64_t)dtns;
-	printf("period for dummy load is set to %ld s %ld ns\n", period.tv_sec, period.tv_nsec);
+	printf("period for dummy load %d is set to %ld s %ld ns\n",
+		l->tid, period.tv_sec, period.tv_nsec);
 
-	periodic_loop(&period, gen_load);
+
+	periodic_loop(&period, gen_load, l);
 }
 	
 static void error(void)
@@ -160,115 +183,131 @@ static void error(void)
 /*
  * This is similar to how procps package cmd "top" calculate load
  */
-static void calc_load(uint64_t deltaus)
+static void calc_load(uint64_t deltaus, struct sload *l)
 {
 	int status;
 	struct rusage cru;
 	uint64_t delta_utime, delta_stime;
-	static int updated = 0;
 	
-
-	memset(&cru, 0, sizeof(cru));
-
-        status = getrusage(RUSAGE_SELF, &cru);
-	if (status != 0)
-		return;
+	memcpy(&cru, &(l->ru), sizeof(struct rusage));
 
 	delta_utime = (cru.ru_utime.tv_sec*1000000 + cru.ru_utime.tv_usec) -
-			(lru.ru_utime.tv_sec*1000000 + lru.ru_utime.tv_usec);
+			(l->lru.ru_utime.tv_sec*1000000 + l->lru.ru_utime.tv_usec);
 
 	delta_stime = (cru.ru_stime.tv_sec*1000000 + cru.ru_stime.tv_usec) -
-			(lru.ru_stime.tv_sec*1000000 + lru.ru_stime.tv_usec);
+			(l->lru.ru_stime.tv_sec*1000000 + l->lru.ru_stime.tv_usec);
 
-	if (updated) {
-		actual_load = 100.0 * ((float)((delta_utime+delta_stime) / (float)deltaus));
+	if (l->updated) {
+		l->actual_load = 100.0 * ((float)((delta_utime+delta_stime) / (float)deltaus));
 	}
 	
-	memcpy(&lru, &cru, sizeof(struct rusage));
-	updated = 1;
+	memcpy(&(l->lru), &cru, sizeof(struct rusage));
+	l->updated = 1;
 }
 
-static void tune_load()
+static void tune_load(struct sload *l)
 {
 	uint64_t myload;
 
-	e = requested_load - actual_load;
+	l->e = requested_load - l->actual_load;
 
-	p = Kp*e;
+	l->p = Kp*l->e;
 
-	itmp += e;
-	if (itmp > imax)
-		itmp = imax;
-	else if (itmp < imin)
-		itmp = imin;
-	i = Ki*itmp;
+	l->itmp += l->e;
+	if (l->itmp > imax)
+		l->itmp = imax;
+	else if (l->itmp < imin)
+		l->itmp = imin;
+	l->i = Ki*l->itmp;
 
-	d = Kd * (dtmp - e);
-	dtmp = e;
+	l->d = Kd * (l->dtmp - l->e);
+	l->dtmp = l->e;
 
-	out = lastout + (p + i + d);
+	l->out = l->lastout + (l->p + l->i + l->d);
 
-	if (out > outmax)
-		out = outmax;
-	else if (out < outmin)
-		out = outmin;
+	if (l->out > outmax)
+		l->out = outmax;
+	else if (l->out < outmin)
+		l->out = outmin;
 
-	lastout = out;
+	l->lastout = l->out;
 
 	// export to dummyload thread
-	looplimit = (uint64_t)out;
+	l->looplimit = (uint64_t)(l->out);
 }
 
-static void worker(struct timespec *tactual)
+static void worker(struct timespec *tactual, struct sload *l)
 {
 	uint64_t deltaus;
+	int i;
 
 	deltaus = tactual->tv_sec*1000000+tactual->tv_nsec/1000;
 
-	// calculate our load
-	calc_load(deltaus);
+	for (i=0; i<instances; i++) {
+		// calculate our load
+		calc_load(deltaus, &(load[i]));
 
-	// adjust it for our needs
-	tune_load();
+		// adjust it for our needs
+		tune_load(&(load[i]));
+	}
 }
 
 int main(int argc, char *argv[])
 {
 	int status;
-	struct timespec resolution;
 	struct sched_param threadsched;
 	pthread_t t;
 	struct timespec period;
+	char strname[16];
+	size_t i;
 
-	if (argc != 2)
-		error();
+	if (argc >= 2) {
+		requested_load = atof(argv[1]);
 
-	requested_load = atof(argv[1]);
+		if ((requested_load > 100.0) || (requested_load < 0.0))
+			error();
+	}
 
-	if ((requested_load > 100.0) || (requested_load < 0.0))
-		error();
+	if (argc >= 3) {
+		instances = atoi(argv[2]);
+		if ((instances > MAX_INSTANCES) || (instances < 1)) {
+			printf("supporting instances between 1 and %d\n", MAX_INSTANCES);
+			error();
+		}
+		if (instances*(int)requested_load > 100) {
+			printf("Sum of all instances generates larger than 100% load which is unsupported\n");
+			error();
+		}
+	} else {
+		instances = 1;
+	}
 
 	ticks_per_second = sysconf(_SC_CLK_TCK);
 	us_per_tick = 1000000/ticks_per_second;
 
-	clock_getres(CLOCK, &resolution);
-	printf("clock resolution is %ld s %ld ns\n", resolution.tv_sec, resolution.tv_nsec);
-
 	// set our period time to 1 tick period
 	dtns = 1*us_per_tick*1000;
 
-	period.tv_sec = 0;
-	period.tv_nsec = (uint64_t)dtns;
-	printf("period for pid regulator is set to %ld s %ld ns\n", period.tv_sec, period.tv_nsec);
+	for (i=0; i<instances; i++) {
+		status = pthread_create(&t, NULL, dummy_load, &(load[i]));
 
-	status = pthread_create(&t, NULL, dummy_load, NULL);
+		sprintf(strname, "dummy_load-%d", i);
+		status = pthread_setname_np(t, strname);
 
-	threadsched.sched_priority = 37;
-	status = sched_setscheduler(0, SCHED_FIFO, &threadsched);
-	if (status) {
-		printf("%s: sched_setscheduler %d\n", __FUNCTION__, status);
-		pthread_exit(&status);
+		threadsched.sched_priority = 37;
+		status = sched_setscheduler(0, SCHED_FIFO, &threadsched);
+		if (status) {
+			printf("%s: sched_setscheduler %d\n", __FUNCTION__, status);
+			pthread_exit(&status);
+		}
 	}
 
-	periodic_loop(&period, worker);
+	pid = getpid();
+
+	period.tv_sec = 0;
+	period.tv_nsec = (uint64_t)dtns;
+	printf("period for pid regulator is set to %ld s %ld ns\n",
+		period.tv_sec, period.tv_nsec);
+
+	periodic_loop(&period, worker, NULL);
 }

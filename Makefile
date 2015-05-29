@@ -1,3 +1,4 @@
+CFLAGS += -D_GNU_SOURCE
 LDFLAGS += -lpthread -lrt
 
 SRCS := $(wildcard *.c)
