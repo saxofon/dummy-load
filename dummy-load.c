@@ -44,6 +44,8 @@ static pid_t pid;
 
 static struct sload {
 	pid_t tid;
+	struct timespec period;
+	uint64_t periodns;
 	struct rusage ru;
 	struct rusage lru;
 	float actual_load;
@@ -96,10 +98,10 @@ static void ts_sub(struct timespec *t1, struct timespec *t2, struct timespec *re
  * helper calling a function at a specifid periodic rate, which should be below 1 sec.
  * work time is expected to be guaranteed less than (period time - clock setup time)
  */
-static void periodic_loop(const struct timespec *period, void (*work)(struct timespec *, struct sload *l), struct sload *l)
+static void periodic_loop(const struct timespec *period, void (*work)(struct timespec *, struct timespec *, struct sload *l), struct sload *l)
 {
 	struct timespec tbase;
-	struct timespec tbefore, tafter, tactual;
+	struct timespec tbefore, tafter, tdelta;
 	int status;
 
 	clock_gettime(CLOCK, &tbase);
@@ -116,24 +118,44 @@ static void periodic_loop(const struct timespec *period, void (*work)(struct tim
 			printf("status = %d\n", status);
 
 		// execute loop work load
-		ts_sub(&tbefore, &tafter, &tactual);
-		if ((tactual.tv_sec == 0) && (tactual.tv_nsec < 1000000)) {
+		ts_sub(&tbefore, &tafter, &tdelta);
+		if ((tdelta.tv_sec == 0) && (tdelta.tv_nsec < 1000000)) {
 			// disregard of corner case were we calculated start of next period,
 			// got interrupted and that for quite some time so that when kernel
 			// get time to schedule this in, we are already past our period!
+			l->updated = 0;
 			continue;
 		}
-		work(&tactual, l);
+		work(&tbefore, &tdelta, l);
 	}
 }
 
-static void gen_load(struct timespec *tactual, struct sload *l)
+static int safeguard_beyond_period(struct timespec *ts, uint64_t periodns_slip_max)
+{
+	struct timespec tnow, tdelta;
+	uint64_t deltans;
+
+	// disregard of corner case were we calculated duration of last period,
+	// got interrupted and that for quite some time so that when kernel
+	// get time to schedule this in, we will not have relevant data!
+	clock_gettime(CLOCK, &tnow);
+	ts_sub(ts, &tnow, &tdelta);
+	deltans = tdelta.tv_sec*1000000000+tdelta.tv_nsec;
+	if (deltans > periodns_slip_max) {
+		printf("load avg not calculated, this process slipped too much\n");
+		return 1;
+	} else {
+		return 0;
+	}
+}
+
+static void gen_load(struct timespec *ts, struct timespec *tdelta, struct sload *l)
 {
 	static unsigned int volatile dummy;
 	int i;
 	int status;
 
-	// here we do the actual dummy work
+	// here we do the delta dummy work
 	if (requested_load >= 100.0) {
 		while (1) {
 			dummy = (int)requested_load;
@@ -152,7 +174,6 @@ static void *dummy_load(void *arg)
 {
 	int status;
 	struct sched_param threadsched;
-	struct timespec period;
 	struct sload *l = (struct sload *)arg;
 
 	threadsched.sched_priority = 36;
@@ -165,13 +186,14 @@ static void *dummy_load(void *arg)
 	//load[instance].tid = gettid();
 	l->tid = syscall(SYS_gettid);
 
-	period.tv_sec = 0;
-	period.tv_nsec = (uint64_t)dtns;
+	l->period.tv_sec = 0;
+	l->period.tv_nsec = (uint64_t)dtns;
 	printf("period for dummy load %d is set to %ld s %ld ns\n",
-		l->tid, period.tv_sec, period.tv_nsec);
+		l->tid, l->period.tv_sec, l->period.tv_nsec);
 
+	l->periodns = l->period.tv_sec*1000000000+l->period.tv_nsec;
 
-	periodic_loop(&period, gen_load, l);
+	periodic_loop(&(l->period), gen_load, l);
 }
 	
 static void error(void)
@@ -183,11 +205,11 @@ static void error(void)
 /*
  * This is similar to how procps package cmd "top" calculate load
  */
-static void calc_load(uint64_t deltaus, struct sload *l)
+static void calc_load(struct timespec *ts, uint64_t deltaus, struct sload *l)
 {
 	int status;
 	struct rusage cru;
-	uint64_t delta_utime, delta_stime;
+	uint64_t delta_utime, delta_stime, deltans;
 	
 	memcpy(&cru, &(l->ru), sizeof(struct rusage));
 
@@ -197,7 +219,9 @@ static void calc_load(uint64_t deltaus, struct sload *l)
 	delta_stime = (cru.ru_stime.tv_sec*1000000 + cru.ru_stime.tv_usec) -
 			(l->lru.ru_stime.tv_sec*1000000 + l->lru.ru_stime.tv_usec);
 
-	if (l->updated) {
+	if (safeguard_beyond_period(ts, (uint64_t)(l->periodns * 1.1))) {
+		l->updated=0;
+	} else {
 		l->actual_load = 100.0 * ((float)((delta_utime+delta_stime) / (float)deltaus));
 	}
 	
@@ -205,7 +229,7 @@ static void calc_load(uint64_t deltaus, struct sload *l)
 	l->updated = 1;
 }
 
-static void tune_load(struct sload *l)
+static void tune_load(struct timespec *ts, struct sload *l)
 {
 	uint64_t myload;
 
@@ -232,23 +256,26 @@ static void tune_load(struct sload *l)
 
 	l->lastout = l->out;
 
-	// export to dummyload thread
-	l->looplimit = (uint64_t)(l->out);
+	if (safeguard_beyond_period(ts, (uint64_t)(l->periodns * 1.1))) {
+		l->updated=0;
+	} else {
+		l->looplimit = (uint64_t)(l->out);
+	}
 }
 
-static void worker(struct timespec *tactual, struct sload *l)
+static void worker(struct timespec *ts, struct timespec *tdelta, struct sload *l)
 {
 	uint64_t deltaus;
 	int i;
 
-	deltaus = tactual->tv_sec*1000000+tactual->tv_nsec/1000;
+	deltaus = tdelta->tv_sec*1000000+tdelta->tv_nsec/1000;
 
 	for (i=0; i<instances; i++) {
 		// calculate our load
-		calc_load(deltaus, &(load[i]));
+		calc_load(ts, deltaus, &(load[i]));
 
 		// adjust it for our needs
-		tune_load(&(load[i]));
+		tune_load(ts, &(load[i]));
 	}
 }
 
